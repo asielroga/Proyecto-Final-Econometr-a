@@ -1,0 +1,1344 @@
+---
+title: "Proyecto final | Econometría y portafolios (versión consolidada)"
+date: "2026-11-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+---
+
+
+## Bloque 01. Configuración y librerías
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(dplyr); library(tidyr); library(ggplot2)
+#Ruta de datos
+ruta_datos <- "C:/Users/L03539738/OneDrive - Instituto Tecnologico y de Estudios Superiores de Monterrey/Documents/Asiel data/MAF/Econometría/Proyecto"
+#Nombres de archivos
+archivos <- c("1min" = "Base_1min.csv", "5min" = "Base_5min.csv",
+              "30min" = "Base_30min.csv", "diarios" = "Base_diarios.csv")
+rutas <- setNames(
+  file.path(ruta_datos, archivos),
+  names(archivos)
+)
+if (!all(file.exists(rutas))) stop("No se encontraron: ", paste(rutas[!file.exists(rutas)], collapse = ", "))
+empresas <- c("AAPL", "ABBV", "ADBE", "JNJ", "LLY", "MRK", "MSFT", "NVDA", "ORCL", "PFE")
+sectores <- tibble(Ticker = empresas,
+                  Sector = if_else(Ticker %in% c("AAPL", "ADBE", "MSFT", "NVDA", "ORCL"), "Tecnología", "Salud"))
+
+#Supuestos: una tasa libre de riesgo del 4% y un capital de $100,000 usd
+tasa_libre_riesgo <- 0.04
+capital_inicial <- 100000
+```
+
+
+## Bloque 02. Importación estandarizada de las cuatro bases
+
+```{r}
+#Se importan las cuatro bases de datos con frecuencias de un minuto, cinco minutos, treinta minutos y diaria. La información se estandariza mediante la conversión de fechas a la zona horaria de Nueva York, así como de precios y volúmenes a formatos numéricos.
+
+cargar_base <- function(archivo, frecuencia) {
+  x <- readr::read_csv(archivo, show_col_types = FALSE,
+                       locale = readr::locale(encoding = "UTF-8"))
+  requeridas <- c("Timestamp_NY", "Ticker", "Open", "High", "Low", "Close", "Volume")
+  stopifnot(all(requeridas %in% names(x)))
+  x <- x %>% mutate(Ticker = as.character(Ticker),
+                    across(all_of(c("Open", "High", "Low", "Close", "Volume")), as.numeric),
+                    Frecuencia = frecuencia)
+  if (frecuencia == "diarios") {
+    x <- x %>% mutate(Fecha = as.Date(Timestamp_NY),
+                      Fecha_Hora = as.POSIXct(Fecha, tz = "America/New_York"))
+  } else {
+    x <- x %>% mutate(Fecha_Hora = as.POSIXct(Timestamp_NY,
+                     format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York"),
+                      Fecha = as.Date(Fecha_Hora, tz = "America/New_York"))
+  }
+  arrange(x, Fecha_Hora, Ticker)
+}
+# Se importan para verificar existencia y estructura; el modelado intradía queda para la siguiente etapa.
+base_1min <- cargar_base(rutas[["1min"]], "1min")
+base_5min <- cargar_base(rutas[["5min"]], "5min")
+base_30min <- cargar_base(rutas[["30min"]], "30min")
+base_diaria <- cargar_base(rutas[["diarios"]], "diarios") %>% left_join(sectores, by = "Ticker")
+print(tibble(Base = names(archivos), Filas = c(nrow(base_1min), nrow(base_5min), nrow(base_30min), nrow(base_diaria))))
+
+#Se importaron 131,600 observaciones de un minuto, 148,160 de cinco minutos, 29,810 de treinta minutos y 12,600 diarias. Cada archivo contiene información de las diez empresas seleccionadas.
+
+```
+
+
+## Bloque 03. Calidad y rendimientos diarios
+
+```{r}
+#Se verifica la integridad de las bases mediante la identificación de valores faltantes, registros duplicados e inconsistencias en los precios de apertura, máximos, mínimos y cierre. Posteriormente, se calculan los rendimientos simples y logarítmicos diarios utilizando los precios de cierre consecutivos de cada empresa.
+
+validar_base <- function(x, nombre) {
+  tibble(Base = nombre, Filas = nrow(x), Empresas = n_distinct(x$Ticker),
+         Fechas = n_distinct(x$Fecha),
+         NA_criticos = sum(!complete.cases(x[, c("Ticker", "Fecha_Hora", "Open", "High", "Low", "Close", "Volume")])),
+         Duplicados = sum(duplicated(x[, c("Ticker", "Fecha_Hora")])),
+         OHLC_invalidos = sum(x$High < pmax(x$Open, x$Close, x$Low) |
+                            x$Low > pmin(x$Open, x$Close, x$High) |
+                            x$Open <= 0 | x$Close <= 0 | x$Volume < 0, na.rm = TRUE))
+}
+reporte_validacion <- bind_rows(validar_base(base_1min, "1min"), validar_base(base_5min, "5min"),
+                                validar_base(base_30min, "30min"), validar_base(base_diaria, "diarios"))
+print(reporte_validacion)
+stopifnot(!anyDuplicated(base_diaria[, c("Ticker", "Fecha")]))
+rendimientos_diarios <- base_diaria %>% arrange(Ticker, Fecha) %>% group_by(Ticker) %>%
+  mutate(Cierre_Anterior = lag(Close), Rendimiento_Simple = Close / Cierre_Anterior - 1,
+         Rendimiento_Log = log(Close / Cierre_Anterior)) %>% ungroup() %>%
+  filter(is.finite(Rendimiento_Simple), is.finite(Rendimiento_Log))
+print(rendimientos_diarios %>% count(Ticker), n = 10)
+
+#Las cuatro bases presentaron cero valores críticos faltantes, cero registros duplicados y cero inconsistencias OHLC según las validaciones implementadas. Después de calcular los rendimientos, cada empresa conservó 1,259 observaciones diarias.
+
+
+#La información superó los controles programados, permitiendo continuar con los análisis econométricos. Los rendimientos expresan las variaciones relativas de los precios y permiten comparar empresas con diferentes niveles de cotización.
+
+```
+
+
+## Bloque 04. División cronológica y matrices
+
+```{r}
+#Se divide la información histórica en tres conjuntos independientes y ordenados cronológicamente. Esta separación permite entrenar modelos con datos anteriores, seleccionar alternativas con un periodo de validación y medir su desempeño en observaciones posteriores.
+
+datos_entrenamiento <- rendimientos_diarios %>% filter(Fecha <= as.Date("2024-12-31"))
+datos_validacion <- rendimientos_diarios %>% filter(Fecha >= as.Date("2025-01-01"), Fecha <= as.Date("2025-12-31"))
+datos_prueba <- rendimientos_diarios %>% filter(Fecha >= as.Date("2026-01-01"))
+periodos <- list(Entrenamiento = datos_entrenamiento, Validacion_2025 = datos_validacion, Prueba_2026 = datos_prueba)
+matriz_ancha <- function(x) x %>% select(Fecha, Ticker, Rendimiento_Simple) %>%
+  pivot_wider(names_from = Ticker, values_from = Rendimiento_Simple) %>% arrange(Fecha)
+validar_matriz <- function(x) {
+  stopifnot(all(empresas %in% names(x)), !anyNA(x[, empresas]))
+  x
+}
+datos_regresion <- validar_matriz(matriz_ancha(datos_entrenamiento))
+retornos_train <- as.matrix(datos_regresion[, empresas])
+print(bind_rows(lapply(names(periodos), function(nm) {
+  x <- periodos[[nm]]
+  tibble(Periodo = nm, Inicio = min(x$Fecha), Fin = max(x$Fecha), Dias = n_distinct(x$Fecha), Filas = nrow(x))
+})))
+
+#El entrenamiento abarca 795 días bursátiles, de noviembre de 2021 a diciembre de 2024; la validación comprende 250 días de 2025; y la prueba contiene 214 días entre enero y noviembre de 2026.
+
+#La división temporal limita el uso indebido de datos futuros y permite una evaluación fuera de muestra. En particular, 2026 sirve para comprobar la estabilidad de las relaciones identificadas durante el entrenamiento y la validación.
+
+```
+
+
+## Bloque 05. Descriptivos, correlación y covarianza
+
+```{r}
+#Se calculan la media diaria, la volatilidad anualizada y los extremos de rendimiento para cada acción. También se estiman las matrices de correlación y covarianza utilizando exclusivamente el conjunto de entrenamiento, pues estas matrices se emplearán para construir el portafolio optimizado.
+
+estadistica_rendimientos <- rendimientos_diarios %>% group_by(Ticker, Sector) %>%
+  summarise(Media_Diaria = mean(Rendimiento_Simple), Volatilidad_Anual = sd(Rendimiento_Simple) * sqrt(252),
+            Minimo = min(Rendimiento_Simple), Maximo = max(Rendimiento_Simple), .groups = "drop")
+print(estadistica_rendimientos, n = 10)
+matriz_correlacion <- cor(retornos_train)
+sigma_anual <- cov(retornos_train) * 252
+mu_anual <- colMeans(retornos_train) * 252
+corr_larga <- as.data.frame(as.table(matriz_correlacion))
+ggplot(corr_larga, aes(Var1, Var2, fill = Freq)) + geom_tile() +
+  scale_fill_gradient2(low = "#2563EB", mid = "white", high = "#EF4444", midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlaciones de rendimientos diarios (entrenamiento)", x = NULL, y = NULL, fill = "Pearson") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#NVIDIA presentó la mayor volatilidad anualizada, de aproximadamente 52%, seguida por Oracle con 45%. Johnson & Johnson obtuvo la menor volatilidad, de 18.1%. NVIDIA mostró además el mayor rendimiento diario promedio, cercano a 0.21%, dentro del periodo histórico completo.
+
+#Existen diferencias considerables entre los perfiles de riesgo de las compañías. La covarianza resulta fundamental porque el riesgo de un portafolio no depende únicamente de la volatilidad individual de sus componentes, sino también de cómo se mueven conjuntamente.
+
+```
+
+
+## Bloque 06. Regresiones contemporáneas (MCO)
+
+
+```{r}
+#Se ajusta un modelo de regresión lineal para cada empresa, tomando su rendimiento diario como variable dependiente y los rendimientos del mismo día de las nueve empresas restantes como variables explicativas. Se presentan el R², el R² ajustado y la prueba F global del modelo.
+
+modelos_ols <- setNames(lapply(empresas, function(ticker) {
+  lm(reformulate(setdiff(empresas, ticker), response = ticker), data = datos_regresion)
+}), empresas)
+resumen_regresiones <- bind_rows(lapply(empresas, function(ticker) {
+  s <- summary(modelos_ols[[ticker]])
+  tibble(Ticker = ticker, Observaciones = nobs(modelos_ols[[ticker]]),
+         R_Cuadrado = s$r.squared, R_Cuadrado_Ajustado = s$adj.r.squared,
+         Estadistico_F = unname(s$fstatistic[1]),
+         P_Valor_F = pf(s$fstatistic[1], s$fstatistic[2], s$fstatistic[3], lower.tail = FALSE))
+})) %>% arrange(desc(R_Cuadrado_Ajustado))
+print(resumen_regresiones, n = 10)
+
+#Microsoft alcanzó el mayor R², de 0.641, seguido de Apple (0.515) y NVIDIA (0.499). Pfizer presentó el menor R², de 0.223. Las pruebas F de los diez modelos arrojaron valores p muy pequeños.
+
+#Los rendimientos simultáneos de otras empresas presentan una asociación estadísticamente relevante con los rendimientos de la acción estudiada. Sin embargo, al utilizar variables correspondientes al mismo día, estos modelos describen relaciones contemporáneas y no demuestran capacidad para anticipar rendimientos futuros.
+
+```
+
+
+## Bloque 07. Diagnósticos econométricos: VIF, BP y DW
+
+```{r}
+#Se evalúan los supuestos de las regresiones mediante el factor de inflación de la varianza (VIF), la prueba de Breusch–Pagan para heterocedasticidad y la prueba de Durbin–Watson para autocorrelación de primer orden.
+
+diagnosticos_ols <- bind_rows(lapply(empresas, function(ticker) {
+  m <- modelos_ols[[ticker]]
+  vif_max <- max(car::vif(m))
+  bp <- lmtest::bptest(m)
+  dw <- lmtest::dwtest(m, alternative = "two.sided")
+  tibble(Ticker = ticker, VIF_Maximo = vif_max,
+         Multicolinealidad = if_else(vif_max < 5, "Sin alerta", "Revisar"),
+         BP_Estadistico = unname(bp$statistic), BP_P_Valor = bp$p.value,
+         Heterocedasticidad = if_else(bp$p.value < .05, "Evidencia", "No detectada"),
+         DW_Estadistico = unname(dw$statistic), DW_P_Valor = dw$p.value,
+         Autocorrelacion = if_else(dw$p.value < .05, "Evidencia", "No detectada"))
+}))
+print(diagnosticos_ols, n = 10, width = Inf)
+
+# Los VIF máximos oscilaron aproximadamente entre 1.84 y 2.79, por debajo del umbral de alerta de cinco. Breusch–Pagan detectó evidencia de heterocedasticidad en MRK, NVDA y PFE. Durbin–Watson señaló evidencia de autocorrelación para MRK (valor p = 0.0306).
+
+#No se observó multicolinealidad elevada según el criterio utilizado, pero algunos modelos incumplen supuestos sobre el comportamiento de los errores. Por ello, conviene interpretar con cautela la inferencia estadística convencional y considerar errores estándar robustos en análisis posteriores.
+
+```
+
+
+## Bloque 08. Regresiones predictivas simples y múltiples con rezagos
+
+```{r}
+#Se construyen variables con el rendimiento del día anterior para evitar utilizar rendimientos contemporáneos al pronosticar. Para cada acción se estima un modelo simple con su propio rezago y un modelo múltiple con los rezagos de las otras nueve empresas. Los modelos se entrenan exclusivamente con datos de 2021 a 2024.
+
+crear_rezagos <- function(x) {
+  x <- validar_matriz(x) %>% arrange(Fecha)
+  for (ticker in empresas) x[[paste0(ticker, "_Lag1")]] <- dplyr::lag(x[[ticker]])
+  x
+}
+base_train_pred <- crear_rezagos(datos_regresion) %>% drop_na()
+modelos_simples <- setNames(lapply(empresas, function(ticker) {
+  lm(reformulate(paste0(ticker, "_Lag1"), response = ticker), data = base_train_pred)
+}), empresas)
+modelos_predictivos <- setNames(lapply(empresas, function(ticker) {
+  lm(reformulate(paste0(setdiff(empresas, ticker), "_Lag1"), response = ticker), data = base_train_pred)
+}), empresas)
+resumen_predictivo <- bind_rows(lapply(empresas, function(ticker) {
+  s <- summary(modelos_predictivos[[ticker]])
+  tibble(Ticker = ticker, R2 = s$r.squared, R2_Ajustado = s$adj.r.squared,
+         P_Valor_F = pf(s$fstatistic[1], s$fstatistic[2], s$fstatistic[3], lower.tail = FALSE))
+}))
+print(resumen_predictivo, n = 10)
+
+#Los modelos múltiples presentaron R² bajos, aproximadamente entre 0.0061 (NVIDIA) y 0.0211 (Pfizer). Ninguno de los modelos múltiples obtuvo una prueba F significativa al 5%; Pfizer fue el más cercano, con valor p de 0.0527.
+
+```
+
+
+## Bloque 09. Validación 2025 y elección por RMSE
+
+```{r}
+#Se comparan tres alternativas de pronóstico para cada acción: regresión simple, regresión múltiple y una referencia que predice rendimiento cero. La selección utiliza el RMSE del año 2025; asimismo se calculan MAE y R² fuera de muestra.
+
+preparar_periodo <- function(periodo, anterior) {
+  a <- validar_matriz(matriz_ancha(periodo))
+  ultimo <- validar_matriz(matriz_ancha(anterior)) %>% slice_tail(n = 1)
+  crear_rezagos(bind_rows(ultimo, a)) %>% filter(Fecha > max(ultimo$Fecha)) %>% drop_na()
+}
+base_validacion <- preparar_periodo(datos_validacion, datos_entrenamiento)
+metricas_pred <- function(real, pred) {
+  c(MAE = mean(abs(real - pred)), RMSE = sqrt(mean((real - pred)^2)),
+    R2 = 1 - sum((real - pred)^2) / sum((real - mean(real))^2))
+}
+comparacion_modelos <- bind_rows(lapply(empresas, function(ticker) {
+  real <- base_validacion[[ticker]]
+  a <- metricas_pred(real, predict(modelos_simples[[ticker]], newdata = base_validacion))
+  b <- metricas_pred(real, predict(modelos_predictivos[[ticker]], newdata = base_validacion))
+  c0 <- metricas_pred(real, rep(0, length(real)))
+  ganadores <- c("A - Regresion simple", "B - Regresion multiple", "C - Prediccion cero")
+  tibble(Ticker = ticker, RMSE_A = a["RMSE"], RMSE_B = b["RMSE"], RMSE_C = c0["RMSE"],
+         MAE_A = a["MAE"], MAE_B = b["MAE"], MAE_C = c0["MAE"],
+         R2_A = a["R2"], R2_B = b["R2"], R2_C = c0["R2"],
+         Mejor_Modelo = ganadores[which.min(c(a["RMSE"], b["RMSE"], c0["RMSE"]))])
+}))
+print(comparacion_modelos, n = 10, width = Inf)
+print(count(comparacion_modelos, Mejor_Modelo))
+
+#La regresión simple fue seleccionada para AAPL, LLY, MSFT, NVDA y ORCL. La predicción cero fue seleccionada para ABBV, ADBE, JNJ, MRK y PFE. La regresión múltiple no resultó ganadora para ninguna empresa.
+
+#El modelo con más variables no necesariamente ofrece mejores pronósticos. En cinco de las diez acciones, una referencia tan sencilla como el rendimiento cero produjo un RMSE inferior al de los modelos ajustados, evidenciando la dificultad de superar pronósticos financieros básicos.
+
+```
+
+
+## Bloque 10. Prueba 2026 de los modelos elegidos
+
+###Los modelos se ajustan en 2021–2024, se eligen en 2025 y se evalúan en 2026. La referencia cero no necesita entrenamiento.
+
+```{r}
+
+#Se mantienen los modelos entrenados con datos anteriores y seleccionados mediante la validación de 2025. Posteriormente se evalúan en 214 días bursátiles de 2026, comparando su RMSE contra la referencia de rendimiento cero.
+
+base_prueba <- preparar_periodo(datos_prueba, datos_validacion)
+resultados_2026 <- bind_rows(lapply(empresas, function(ticker) {
+  real <- base_prueba[[ticker]]
+  elegido <- comparacion_modelos$Mejor_Modelo[comparacion_modelos$Ticker == ticker]
+  pred <- if (elegido == "A - Regresion simple") {
+    predict(modelos_simples[[ticker]], newdata = base_prueba)
+  } else if (elegido == "B - Regresion multiple") {
+    predict(modelos_predictivos[[ticker]], newdata = base_prueba)
+  } else rep(0, length(real))
+  met <- metricas_pred(real, pred)
+  rmse_cero <- sqrt(mean(real^2))
+  tibble(Ticker = ticker, Modelo = elegido, MAE = met["MAE"], RMSE = met["RMSE"],
+         RMSE_Cero = rmse_cero, R2 = met["R2"], Mejora_RMSE_Pct = (1 - met["RMSE"] / rmse_cero) * 100)
+})) %>% arrange(desc(Mejora_RMSE_Pct))
+print(resultados_2026, n = 10, width = Inf)
+cat("Mejora media relativa RMSE (%):", mean(resultados_2026$Mejora_RMSE_Pct), "\n")
+
+#Apple fue la única acción con una mejora positiva respecto a la referencia cero (0.202%). Microsoft, Oracle, NVIDIA y Lilly registraron deterioros de 0.0812%, 0.192%, 0.402% y 0.770%, respectivamente. Las otras cinco acciones utilizaron directamente la referencia cero. La mejora media relativa fue de −0.1243%.
+
+#La ventaja predictiva observada en 2025 no se mantuvo de forma general en 2026. Esto confirma que la selección de modelos debe juzgarse mediante datos no utilizados anteriormente y que pequeños avances de RMSE pueden desaparecer cuando cambian las condiciones del mercado.
+
+```
+
+
+## Bloque 11. Optimización de mínima varianza con restricciones
+
+```{r}
+#Se construyen dos estrategias: una equiponderada, con 10% del capital por acción, y otra de mínima varianza, calculada mediante programación cuadrática con la matriz de covarianza de entrenamiento. Se exige invertir el 100% del capital, no utilizar posiciones cortas y limitar cada peso individual a un máximo de 20%.
+
+n <- length(empresas)
+peso_maximo <- 0.20
+pesos_iguales <- setNames(rep(1 / n, n), empresas)
+# quadprog: minimizar w' Sigma w, suma(w)=1, 0 <= w <= 0.20
+Dmat <- 2 * sigma_anual[empresas, empresas] + diag(1e-8, n)
+Amat <- cbind(rep(1, n), diag(n), -diag(n))
+bvec <- c(1, rep(0, n), rep(-peso_maximo, n))
+sol <- quadprog::solve.QP(Dmat, rep(0, n), Amat, bvec, meq = 1)
+pesos_minvar <- setNames(sol$solution, empresas)
+stopifnot(abs(sum(pesos_minvar) - 1) < 1e-6, all(pesos_minvar >= -1e-6), all(pesos_minvar <= .20 + 1e-6))
+tabla_pesos <- tibble(Ticker = empresas, Sector = sectores$Sector,
+                     Peso_Igual_Pct = 100 * pesos_iguales[empresas],
+                     Peso_MinVar_Pct = 100 * pesos_minvar[empresas])
+print(tabla_pesos, n = 10)
+
+#El portafolio optimizado asignó aproximadamente 20% a ABBV, JNJ y MRK; 9.79% a AAPL; 9.06% a MSFT; y un peso prácticamente nulo a NVDA. Los pesos respetaron las restricciones establecidas.
+
+#El algoritmo favoreció una combinación que minimiza la varianza histórica estimada, en lugar de perseguir directamente el mayor rendimiento. La asignación prácticamente nula a NVIDIA responde a la solución de optimización bajo las restricciones y covarianzas observadas, no a una predicción de que su rendimiento futuro será negativo.
+
+```
+
+
+## Bloque 12. Evaluación uniforme de ambos portafolios
+
+```{r}
+#Se aplican los mismos pesos de cada estrategia a los rendimientos de entrenamiento, validación y prueba. Se calculan rendimiento acumulado y anualizado, volatilidad anualizada, ratio de Sharpe y máximo drawdown. Los pesos optimizados no se recalculan con datos de 2025 ni 2026.
+
+calcular_portafolio <- function(datos, pesos) {
+  ancho <- validar_matriz(matriz_ancha(datos))
+  r <- as.numeric(as.matrix(ancho[, names(pesos)]) %*% pesos)
+  capital <- cumprod(1 + r)
+  riqueza <- c(1, capital)
+  vol <- sd(r) * sqrt(252)
+  tibble(Observaciones = length(r), Rendimiento_Acumulado = tail(capital, 1) - 1,
+         Rendimiento_Anualizado = tail(capital, 1)^(252 / length(r)) - 1,
+         Volatilidad_Anualizada = vol,
+         Sharpe = (mean(r) * 252 - tasa_libre_riesgo) / vol,
+         Max_Drawdown = min(riqueza / cummax(riqueza) - 1))
+}
+resultados_portafolios <- bind_rows(lapply(names(periodos), function(p) {
+  bind_rows(calcular_portafolio(periodos[[p]], pesos_iguales) %>% mutate(Periodo = p, Portafolio = "Pesos iguales"),
+            calcular_portafolio(periodos[[p]], pesos_minvar) %>% mutate(Periodo = p, Portafolio = "Minima varianza"))
+})) %>% select(Periodo, Portafolio, everything())
+print(resultados_portafolios, n = 6, width = Inf)
+
+#Durante el entrenamiento, el portafolio equiponderado alcanzó 60.7% de rendimiento acumulado, frente a 28.8% del de mínima varianza. En validación 2025, los rendimientos fueron 20.5% y 22.1%, respectivamente. En prueba 2026, la estrategia equilibrada obtuvo 11.9% y la de mínima varianza 25.2%; sus Sharpe fueron 0.667 y 1.51, respectivamente.
+
+#La estrategia equilibrada obtuvo una rentabilidad superior en el entrenamiento, pero mínima varianza mostró mejores resultados ajustados por riesgo durante la prueba de 2026. La evidencia respalda la utilidad potencial de diversificar con información de covarianza, aunque el desempeño observado no garantiza resultados futuros.
+
+```
+
+
+## Bloque 13. Gráfica riesgo-rendimiento
+
+```{r}
+#Se construye un diagrama que ubica cada portafolio de acuerdo con su volatilidad anualizada y rendimiento anualizado, separando entrenamiento, validación y prueba. Esta representación facilita la comparación simultánea de riesgo y rendimiento.
+
+grafica_riesgo <- resultados_portafolios %>% mutate(
+  Periodo = factor(Periodo, levels = names(periodos), labels = c("Entrenamiento", "Validación 2025", "Prueba 2026")))
+ggplot(grafica_riesgo, aes(Volatilidad_Anualizada, Rendimiento_Anualizado, color = Portafolio)) +
+  geom_point(size = 3.5) +
+  facet_wrap(~Periodo, scales = "free_x") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = .1), expand = expansion(mult = .2)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = .12)) +
+  labs(title = "Comparación riesgo-rendimiento", x = "Volatilidad anualizada", y = "Rendimiento anualizado") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+#En 2026, mínima varianza presentó un rendimiento anualizado de 30.3% con volatilidad de 15.7%, frente a 14.2% de rendimiento y 15.8% de volatilidad del equilibrado
+
+#Durante la prueba de 2026, mínima varianza obtuvo un mayor rendimiento con un nivel de volatilidad muy similar, por lo que dominó a la estrategia equilibrada en esta comparación histórica. No obstante, las diferencias entre periodos muestran que el posicionamiento relativo de los portafolios puede cambiar con el tiempo.
+
+
+```
+
+
+## Bloque 14. Evolución del capital y drawdown
+
+```{r}
+#Se simula el crecimiento compuesto de un capital hipotético de 100,000 unidades monetarias para cada estrategia, reiniciando ese capital al inicio de cada periodo. También se calcula el drawdown, definido como la caída relativa respecto al máximo de capital alcanzado previamente.
+
+evolucion_capital <- function(datos, pesos, nombre, periodo) {
+  x <- validar_matriz(matriz_ancha(datos))
+  r <- as.numeric(as.matrix(x[, names(pesos)]) %*% pesos)
+  capital <- capital_inicial * cumprod(1 + r)
+  tibble(Fecha = x$Fecha, Capital = capital, Portafolio = nombre, Periodo = periodo,
+         Drawdown = capital / cummax(c(capital_inicial, capital))[-1] - 1)
+}
+evolucion_total <- bind_rows(lapply(names(periodos), function(p) {
+  bind_rows(evolucion_capital(periodos[[p]], pesos_iguales, "Pesos iguales", p),
+            evolucion_capital(periodos[[p]], pesos_minvar, "Minima varianza", p))
+})) %>% mutate(Periodo = factor(Periodo, levels = names(periodos),
+                               labels = c("Entrenamiento", "Validación 2025", "Prueba 2026")))
+ggplot(evolucion_total, aes(Fecha, Capital, color = Portafolio)) + geom_line(linewidth = .7) +
+  facet_wrap(~Periodo, scales = "free_x") + scale_y_continuous(labels = scales::label_dollar()) +
+  scale_x_date(date_labels = "%b %y", guide = guide_axis(angle = 45)) +
+  labs(title = "Evolución de capital hipotético de 100,000", x = "Fecha", y = "Capital") +
+  theme_minimal() + theme(legend.position = "bottom")
+ggplot(evolucion_total, aes(Fecha, Drawdown, color = Portafolio)) + geom_line(linewidth = .7) +
+  facet_wrap(~Periodo, scales = "free_x") + scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_date(date_labels = "%b %y", guide = guide_axis(angle = 45)) +
+  labs(title = "Drawdown por periodo", x = "Fecha", y = "Caída desde máximo anterior") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+#En entrenamiento, el capital final aproximado fue 160,700 para pesos iguales y 128,800 para mínima varianza. En prueba 2026, terminó cerca de 111,900 y 125,200, respectivamente. En ese último periodo, el máximo drawdown fue −10.3% para pesos iguales y −6.48% para mínima varianza.
+
+#El análisis temporal complementa los rendimientos agregados mostrando la trayectoria de la inversión y la magnitud de las caídas intermedias. En 2026, mínima varianza combinó un mayor crecimiento del capital con pérdidas máximas relativas menores. Estos resultados son simulados y no descuentan costos de transacción ni otros cargos.
+
+```
+
+
+## Bloque 15. Contribución al riesgo por empresa y sector
+
+```{r}
+#Se descompone la volatilidad del portafolio de mínima varianza para identificar la contribución de cada activo y de los sectores de tecnología y salud. Se diferencia el porcentaje de capital invertido del porcentaje de riesgo que aporta cada grupo.
+
+cov_anual <- sigma_anual[empresas, empresas]
+vol_portafolio <- sqrt(as.numeric(t(pesos_minvar) %*% cov_anual %*% pesos_minvar))
+riesgo_marginal <- as.numeric(cov_anual %*% pesos_minvar) / vol_portafolio
+participacion_riesgo <- 100 * as.numeric(pesos_minvar) * riesgo_marginal / vol_portafolio
+tabla_riesgo <- tibble(Ticker = empresas, Sector = sectores$Sector,
+                      Peso_Pct = 100 * as.numeric(pesos_minvar),
+                      Contribucion_Riesgo_Pct = participacion_riesgo) %>%
+  arrange(desc(Contribucion_Riesgo_Pct))
+riesgo_por_sector <- tabla_riesgo %>% group_by(Sector) %>%
+  summarise(Peso_Pct = sum(Peso_Pct), Contribucion_Riesgo_Pct = sum(Contribucion_Riesgo_Pct), .groups = "drop")
+print(tabla_riesgo, n = 10)
+print(riesgo_por_sector)
+stopifnot(abs(sum(tabla_riesgo$Contribucion_Riesgo_Pct) - 100) < 1e-5)
+grafica_sectores <- riesgo_por_sector %>%
+  pivot_longer(c(Peso_Pct, Contribucion_Riesgo_Pct), names_to = "Indicador", values_to = "Porcentaje") %>%
+  mutate(Indicador = dplyr::recode(Indicador, Peso_Pct = "Capital invertido",
+                                    Contribucion_Riesgo_Pct = "Contribución al riesgo"))
+ggplot(grafica_sectores, aes(Sector, Porcentaje, fill = Indicador)) +
+  geom_col(position = position_dodge(width = .75), width = .65) +
+  geom_text(aes(label = sprintf("%.1f%%", Porcentaje)), position = position_dodge(width = .75), vjust = -.4) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, .15))) +
+  labs(title = "Distribución del capital y del riesgo por sector", x = "Sector", y = "Participación") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+#El sector salud concentró 74.2% del capital y 71.8% de la contribución al riesgo; tecnología representó 25.8% y 28.2%, respectivamente. Entre las mayores contribuciones individuales estuvieron ABBV (aproximadamente 20.8%), MRK (19.4%) y JNJ (16.1%).
+
+#El portafolio optimizado presenta una concentración sectorial importante hacia salud. Aunque la estrategia reduce la varianza histórica, eso no significa que sea equilibrada entre sectores; por ello, la distribución y la contribución al riesgo deben analizarse conjuntamente.
+
+```
+
+## Bloque 16. Datos intradía
+
+```{r}
+#Se examinan por separado las tres frecuencias intradía para documentar su tamaño, cobertura de fechas, número de empresas, valores faltantes y registros duplicados. También se verifica cuántas observaciones corresponden a cada acción.
+
+bases_intradia <- list(`1min` = base_1min, `5min` = base_5min, `30min` = base_30min)
+resumen_intradia <- dplyr::bind_rows(lapply(names(bases_intradia), function(f) {
+  x <- bases_intradia[[f]]
+  tibble(Frecuencia = f, Filas = nrow(x), Empresas = n_distinct(x$Ticker),
+         Inicio = min(x$Fecha, na.rm = TRUE), Fin = max(x$Fecha, na.rm = TRUE),
+         NA_Cierre = sum(is.na(x$Close)), Duplicados = sum(duplicated(x[c("Ticker", "Fecha_Hora")])) )
+}))
+print(resumen_intradia)
+print(bind_rows(lapply(names(bases_intradia), function(f) {
+  bases_intradia[[f]] %>% count(Ticker, name = "Registros") %>% mutate(Frecuencia = f)
+})), n = Inf)
+
+#La cobertura de las bases no es idéntica, por lo que las estadísticas entre frecuencias no deben interpretarse como comparaciones sobre exactamente el mismo periodo de mercado. El control confirma consistencia estructural, aunque no reemplaza la revisión de continuidad de intervalos.
+
+```
+
+## Bloque 17. Rendimientos intradía dentro de cada sesión
+
+```{r}
+#Se calculan rendimientos dentro de cada sesión bursátil utilizando exclusivamente precios separados por el intervalo temporal esperado. También se generan rezagos de rendimiento y volumen, y se excluyen observaciones sin intervalos consecutivos suficientes, evitando unir artificialmente el cierre de un día con la apertura del siguiente.
+
+crear_intradia <- function(x, f) {
+  minutos <- c(`1min` = 1, `5min` = 5, `30min` = 30)[[f]]
+  stopifnot(!anyDuplicated(x[c("Ticker", "Fecha_Hora")]))
+  x %>% filter(Ticker %in% empresas, is.finite(Close), Close > 0) %>%
+    arrange(Ticker, Fecha_Hora) %>% group_by(Ticker, Fecha) %>%
+    mutate(Delta_Min = as.numeric(difftime(Fecha_Hora, lag(Fecha_Hora), units = "mins")),
+           Retorno = if_else(!is.na(Delta_Min) & abs(Delta_Min - minutos) < 0.1,
+                            Close / lag(Close) - 1, NA_real_),
+           Log_Volumen = log1p(pmax(Volume, 0)),
+           Retorno_Lag1 = lag(Retorno), Volumen_Lag1 = lag(Log_Volumen),
+           Delta_Previa = lag(Delta_Min),
+           # Los dos rezagos deben estar en intervalos consecutivos de la misma sesión.
+           Valido = is.finite(Retorno) & is.finite(Retorno_Lag1) &
+                    is.finite(Volumen_Lag1) & !is.na(Delta_Previa) &
+                    abs(Delta_Previa - minutos) < 0.1) %>%
+    ungroup() %>% filter(Valido) %>%
+    select(Fecha, Fecha_Hora, Ticker, Retorno, Retorno_Lag1, Volumen_Lag1)
+}
+# Para evitar copiar tres bases enormes, se calculan y almacenan por separado.
+intradia_modelable <- lapply(names(bases_intradia), function(f) crear_intradia(bases_intradia[[f]], f))
+names(intradia_modelable) <- names(bases_intradia)
+print(bind_rows(lapply(names(intradia_modelable), function(f) {
+  x <- intradia_modelable[[f]]
+  tibble(Frecuencia = f, Registros_Validos = nrow(x), Empresas = n_distinct(x$Ticker))
+})))
+
+#La depuración produce series coherentes para modelar relaciones a corto plazo. El filtrado de un minuto resulta especialmente restrictivo: se conserva alrededor del 45.1% de sus registros originales, lo que debe señalarse como una limitación de cobertura y continuidad, sin confundirlo automáticamente con un error de descarga.
+
+```
+
+## Bloque 18. Estadística descriptiva intradía
+
+```{r}
+#Se calculan para cada empresa y frecuencia el número de observaciones, el rendimiento medio, la desviación estándar y el percentil 95 de los rendimientos absolutos. La gráfica permite comparar la dispersión de las variaciones de precio por intervalo temporal.
+
+descriptivos_intradia <- bind_rows(lapply(names(intradia_modelable), function(f) {
+  intradia_modelable[[f]] %>% group_by(Ticker) %>%
+    summarise(N = n(), Media = mean(Retorno), Desv_Estandar = sd(Retorno),
+              Pct_Absoluto_95 = quantile(abs(Retorno), .95), .groups = "drop") %>%
+    mutate(Frecuencia = f)
+}))
+print(descriptivos_intradia, n = Inf)
+ggplot(descriptivos_intradia, aes(Ticker, Desv_Estandar, fill = Frecuencia)) +
+  geom_col(position = "dodge") + labs(title = "Dispersión del retorno por intervalo", y = "Desviación estándar por intervalo", x = "Acción") + theme_minimal()
+
+#Los resultados reflejan una mayor variabilidad relativa de Oracle y una menor de Johnson & Johnson en varios horizontes intradía. La desviación estándar de intervalos de distinta duración no debe compararse sin considerar que cada una representa un horizonte temporal diferente y que las bases cubren periodos distintos.
+
+```
+
+## Bloque 19. Regresiones simples y múltiples intradía
+
+```{r}
+# Se dividen los días disponibles para cada frecuencia en 70% entrenamiento, 15% validación y 15% prueba. Para cada empresa se estima una regresión simple del retorno actual respecto a su retorno rezagado y una regresión múltiple que agrega el volumen rezagado. En total se generan sesenta modelos, treinta simples y treinta múltiples.
+
+partir_intradia <- function(x) {
+  fechas <- sort(unique(x$Fecha))
+  if (length(fechas) < 12) return(x[FALSE, ] %>% mutate(Particion = character()))
+  n <- length(fechas); a <- max(1, floor(n * .70)); b <- min(n - 1, max(a + 1, floor(n * .85)))
+  x %>% mutate(Particion = case_when(Fecha <= fechas[a] ~ "Train",
+                                      Fecha <= fechas[b] ~ "Validacion", TRUE ~ "Prueba"))
+}
+intradia_partida <- lapply(intradia_modelable, partir_intradia)
+modelos_intradia <- list()
+resumen_mco_intradia <- bind_rows(lapply(names(intradia_partida), function(f) {
+  x <- intradia_partida[[f]]
+  bind_rows(lapply(empresas, function(tk) {
+    train <- x %>% filter(Ticker == tk, Particion == "Train")
+    if (nrow(train) < 40 || sd(train$Retorno) == 0) return(tibble(Frecuencia=f, Ticker=tk, N=nrow(train), R2_Simple=NA_real_, R2_Multiple=NA_real_))
+    a <- lm(Retorno ~ Retorno_Lag1, data=train)
+    b <- lm(Retorno ~ Retorno_Lag1 + Volumen_Lag1, data=train)
+    modelos_intradia[[paste(f, tk, "A", sep="_")]] <<- a
+    modelos_intradia[[paste(f, tk, "B", sep="_")]] <<- b
+    tibble(Frecuencia=f, Ticker=tk, N=nrow(train), R2_Simple=summary(a)$r.squared, R2_Multiple=summary(b)$r.squared)
+  }))
+}))
+print(resumen_mco_intradia, n = Inf)
+
+#Los R² de entrenamiento fueron muy reducidos en las tres frecuencias. El mayor correspondió a Adobe en intervalos de treinta minutos: aproximadamente 0.0110 para el modelo múltiple, equivalente a 1.10% de la variación explicada.
+
+#El retorno y el volumen del intervalo anterior explican una proporción pequeña de las variaciones actuales. Aunque se definieron particiones de validación y prueba, este bloque solo reporta R² de entrenamiento; por ello, todavía no demuestra desempeño predictivo intradía fuera de muestra.
+
+```
+
+## Bloque 20. Diagnósticos intradía
+
+```{r}
+#Se examinan los residuos de los sesenta modelos mediante la prueba Breusch–Pagan de heterocedasticidad y una correlación residual de primer rezago. La prueba Breusch–Pagan se calcula sobre el modelo completo; para la correlación residual se utiliza un máximo de 5,000 residuos ordenados temporalmente.
+
+
+diagnosticos_intradia <- bind_rows(lapply(names(modelos_intradia), function(id) {
+  m <- modelos_intradia[[id]]
+  # Para evitar pruebas prohibitivamente costosas en bases de millones de filas,
+  # se utiliza una submuestra temporalmente ordenada de hasta 5000 residuos.
+  e <- residuals(m); e <- e[seq_len(min(length(e), 5000L))]
+  bp <- tryCatch(lmtest::bptest(m), error=function(e) NULL)
+  tibble(Modelo=id, N=nobs(m), BP_P=if (is.null(bp)) NA_real_ else bp$p.value,
+         Autocorr_Residuo_Lag1=if(length(e)>2) cor(e[-1], e[-length(e)]) else NA_real_)
+}))
+print(diagnosticos_intradia, n = Inf)
+
+#La prueba Breusch–Pagan fue significativa al 5% en 43 de los 60 modelos: los 30 modelos múltiples y 13 de los 30 simples. Las correlaciones residuales de primer rezago observadas fueron de magnitud pequeña, con valores absolutos de hasta aproximadamente 0.040.
+
+#La evidencia frecuente de heterocedasticidad indica que los errores no tienen una varianza constante en numerosos modelos, algo relevante para la inferencia econométrica. Las correlaciones lineales de primer rezago son pequeñas, pero no sustituyen pruebas más amplias de dependencia temporal o heterocedasticidad condicional.
+
+```
+
+## Bloque 21. Series temporales: modelos ARIMA de rendimientos diarios
+
+```{r}
+#Se ajustan modelos ARIMA sobre los rendimientos diarios de entrenamiento y se comparan cuatro órdenes candidatos: ARIMA(0,0,0), ARIMA(1,0,0), ARIMA(0,0,1) y ARIMA(1,0,1). El criterio AIC selecciona el candidato de mejor ajuste penalizado por complejidad para cada empresa.
+
+ordenes_arima <- list(c(0,0,0), c(1,0,0), c(0,0,1), c(1,0,1))
+modelos_arima <- list()
+seleccion_arima <- bind_rows(lapply(empresas, function(tk) {
+  y <- datos_entrenamiento %>% filter(Ticker == tk) %>% arrange(Fecha) %>% pull(Rendimiento_Simple)
+  candidatos <- lapply(ordenes_arima, function(o) tryCatch(stats::arima(y, order=o, method="ML"), error=function(e) NULL))
+  aics <- vapply(candidatos, function(m) if(is.null(m)) Inf else AIC(m), numeric(1))
+  j <- which.min(aics)
+  modelos_arima[[tk]] <<- candidatos[[j]]
+  tibble(Ticker=tk, Orden=paste(ordenes_arima[[j]], collapse=","), AIC=aics[j])
+}))
+print(seleccion_arima, n=10)
+
+#Se seleccionó ARIMA(1,0,1) para Apple y Microsoft; ARIMA(0,0,1) para AbbVie y Eli Lilly; y ARIMA(0,0,0) para Adobe, Johnson & Johnson, Merck, NVIDIA, Oracle y Pfizer. La estimación emitió una advertencia de posible problema de convergencia en uno de los candidatos; el registro no identifica cuál.
+
+#Para seis de las diez empresas, el modelo seleccionado no incorpora términos autorregresivos ni de medias móviles, lo que sugiere escasa estructura lineal aprovechable en los rendimientos diarios. La advertencia requiere verificación antes de asegurar que todos los candidatos fueron estimados de manera estable.
+
+```
+
+## Bloque 22. Forecast ARIMA y evaluación en 2025
+
+```{r}
+#Los modelos seleccionados con datos anteriores a 2025 generan un pronóstico de horizonte completo para los 250 días de validación. Su RMSE se compara con una referencia que predice rendimiento cero durante todo el periodo.
+
+
+resultados_arima <- bind_rows(lapply(empresas, function(tk) {
+  y <- datos_validacion %>% filter(Ticker == tk) %>% arrange(Fecha) %>% pull(Rendimiento_Simple)
+  if (!length(y) || is.null(modelos_arima[[tk]])) return(tibble(Ticker=tk, N=length(y), RMSE_ARIMA=NA_real_, RMSE_Cero=NA_real_, Mejora_Pct=NA_real_))
+  pred <- as.numeric(predict(modelos_arima[[tk]], n.ahead=length(y))$pred)
+  rmse <- function(z) sqrt(mean((y-z)^2))
+  tibble(Ticker=tk, N=length(y), RMSE_ARIMA=rmse(pred), RMSE_Cero=rmse(rep(0,length(y))),
+         Mejora_Pct=100*(1-rmse(pred)/rmse(rep(0,length(y)))))
+}))
+print(resultados_arima, n=10)
+ggplot(resultados_arima, aes(reorder(Ticker, Mejora_Pct), Mejora_Pct)) +
+  geom_col(fill="#2563EB") + coord_flip() + geom_hline(yintercept=0, linetype="dashed") +
+  labs(title="ARIMA vs. retorno cero: validación 2025", x="Empresa", y="Mejora relativa de RMSE (%)") + theme_minimal()
+
+#La mayor mejora relativa de RMSE correspondió a Eli Lilly (0.209%), seguida de AbbVie (0.205%) y NVIDIA (0.127%). Para Johnson & Johnson (−0.0989%) y Pfizer (−0.0226%), ARIMA obtuvo un error superior al de la referencia cero. Todas las mejoras fueron de magnitud muy pequeña.
+
+#ARIMA mostró ventajas limitadas y no generalizadas frente al pronóstico de rendimiento cero. Es importante aclarar que esta evaluación corresponde a un único origen de pronóstico al finalizar 2024 y un horizonte de 250 días, no a un sistema que se actualiza y pronostica nuevamente cada día.
+
+```
+
+## Bloque 23. Preparación de datos de panel trimestral
+
+```{r}
+#Se descargan registros financieros de las diez empresas desde la base pública XBRL de la SEC, incluyendo ingresos, utilidad neta y activos. Se reconstruyen trimestres fiscales y se verifica su integridad. Posteriormente se corrigen los activos, emparejándolos con la fecha de cierre correspondiente al estado de resultados, y se guarda una nueva versión del archivo CSV.
+
+# 1. Instalar y cargar paquetes
+paquetes_sec <- c("httr", "jsonlite", "dplyr",
+                  "tidyr", "readr", "tibble")
+
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# 2. Configuración
+correo_sec <- "asiel98act@gmail.com"
+
+agente_sec <- paste(
+  "ProyectoAcademicoEconometria",
+  correo_sec
+)
+
+empresas_panel <- c(
+  "AAPL", "ABBV", "ADBE", "JNJ", "LLY",
+  "MRK", "MSFT", "NVDA", "ORCL", "PFE"
+)
+
+anio_inicio <- 2022
+anio_fin <- 2025
+
+# 3. Función para consultar la SEC
+consultar_sec <- function(url) {
+
+  respuesta <- httr::GET(
+    url,
+    httr::user_agent(agente_sec),
+    httr::add_headers(
+      Accept = "application/json"
+    ),
+    httr::timeout(90)
+  )
+
+  httr::stop_for_status(respuesta)
+
+  jsonlite::fromJSON(
+    httr::content(
+      respuesta,
+      as = "text",
+      encoding = "UTF-8"
+    ),
+    simplifyVector = FALSE
+  )
+}
+
+# 4. Obtener CIK de cada empresa
+catalogo <- consultar_sec(
+  "https://www.sec.gov/files/company_tickers.json"
+)
+
+tabla_cik <- dplyr::bind_rows(
+  lapply(catalogo, function(x) {
+    tibble(
+      Ticker = x$ticker,
+      CIK = sprintf("%010d", as.integer(x$cik_str))
+    )
+  })
+) %>%
+  filter(Ticker %in% empresas_panel) %>%
+  distinct(Ticker, .keep_all = TRUE)
+
+if (nrow(tabla_cik) != length(empresas_panel)) {
+  stop("No se encontraron todos los CIK.")
+}
+
+print(tabla_cik, n = Inf)
+
+# 5. Etiquetas financieras XBRL
+etiquetas <- list(
+  Ingresos = c(
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+    "SalesRevenueGoodsNet"
+  ),
+  Utilidad_Neta = c(
+    "NetIncomeLoss",
+    "ProfitLoss"
+  ),
+  Activos = c("Assets")
+)
+
+# 6. Extraer hechos XBRL de una variable
+extraer_hechos <- function(facts, tags) {
+
+  gaap <- facts$facts[["us-gaap"]]
+
+  tablas <- list()
+
+  for (i in seq_along(tags)) {
+
+    tag <- tags[i]
+    concepto <- gaap[[tag]]
+
+    if (is.null(concepto)) next
+
+    registros <- concepto$units$USD
+
+    if (is.null(registros)) next
+
+    tabla <- dplyr::bind_rows(
+      lapply(registros, function(z) {
+        tibble(
+          fy = as.integer(z$fy %||% NA_integer_),
+          fp = as.character(z$fp %||% NA_character_),
+          form = as.character(z$form %||% NA_character_),
+          start = as.Date(z$start %||% NA_character_),
+          end = as.Date(z$end %||% NA_character_),
+          filed = as.Date(z$filed %||% NA_character_),
+          valor = as.numeric(z$val %||% NA_real_),
+          tag = tag,
+          prioridad = i
+        )
+      })
+    )
+
+    tablas[[length(tablas) + 1]] <- tabla
+  }
+
+  if (!length(tablas)) return(tibble())
+
+  bind_rows(tablas) %>%
+    filter(
+      form %in% c("10-Q", "10-K"),
+      is.finite(valor),
+      !is.na(end),
+      !is.na(filed),
+      fy >= anio_inicio,
+      fy <= anio_fin,
+      filed >= end,
+      as.numeric(filed - end) <= 180
+    ) %>%
+    mutate(
+      duracion = as.numeric(end - start) + 1
+    )
+}
+
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0) y else x
+}
+
+# 7. Construir valores trimestrales
+construir_trimestres <- function(datos, tipo) {
+
+  if (nrow(datos) == 0) return(tibble())
+
+  if (tipo == "Activos") {
+
+    return(
+      datos %>%
+        filter(
+          fp %in% c("Q1", "Q2", "Q3", "FY"),
+          form %in% c("10-Q", "10-K")
+        ) %>%
+        mutate(
+          Q = if_else(fp == "FY", "Q4", fp)
+        ) %>%
+        arrange(fy, Q, prioridad, filed) %>%
+        group_by(fy, Q) %>%
+        slice(1) %>%
+        ungroup() %>%
+        transmute(
+          Trimestre = paste0(fy, "-", Q),
+          Valor = valor
+        )
+    )
+  }
+
+  # Q1-Q3: periodos de aproximadamente 3 meses
+  trimestrales <- datos %>%
+    filter(
+      fp %in% c("Q1", "Q2", "Q3"),
+      form == "10-Q",
+      duracion >= 65,
+      duracion <= 110
+    ) %>%
+    arrange(fy, fp, prioridad, filed) %>%
+    group_by(fy, fp) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(
+      Trimestre = paste0(fy, "-", fp),
+      Valor = valor
+    )
+
+  # Q4 = total anual - acumulado de 9 meses
+  anuales <- datos %>%
+    filter(
+      fp == "FY",
+      form == "10-K",
+      duracion >= 330,
+      duracion <= 380
+    ) %>%
+    arrange(fy, prioridad, filed) %>%
+    group_by(fy) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(
+      fy,
+      inicio_anual = start,
+      fin_anual = end,
+      valor_anual = valor
+    )
+
+  nueve_meses <- datos %>%
+    filter(
+      fp == "Q3",
+      form == "10-Q",
+      duracion >= 240,
+      duracion <= 300
+    ) %>%
+    arrange(fy, prioridad, filed) %>%
+    group_by(fy) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(
+      fy,
+      inicio_9m = start,
+      fin_9m = end,
+      valor_9m = valor
+    )
+
+  cuarto_trimestre <- anuales %>%
+    inner_join(nueve_meses, by = "fy") %>%
+    filter(
+      abs(as.numeric(inicio_anual - inicio_9m)) <= 7,
+      as.numeric(fin_anual - fin_9m) >= 60,
+      as.numeric(fin_anual - fin_9m) <= 110
+    ) %>%
+    transmute(
+      Trimestre = paste0(fy, "-Q4"),
+      Valor = valor_anual - valor_9m
+    )
+
+  bind_rows(trimestrales, cuarto_trimestre) %>%
+    distinct(Trimestre, .keep_all = TRUE)
+}
+
+# 8. Descargar las diez empresas
+resultados_panel <- list()
+
+for (ticker in empresas_panel) {
+
+  cat("\nDescargando:", ticker, "\n")
+
+  cik <- tabla_cik$CIK[
+    tabla_cik$Ticker == ticker
+  ]
+
+  url <- paste0(
+    "https://data.sec.gov/api/xbrl/companyfacts/",
+    "CIK", cik, ".json"
+  )
+
+  datos_empresa <- tryCatch(
+    consultar_sec(url),
+    error = function(e) {
+      message(
+        "Error en ", ticker, ": ",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+
+  if (is.null(datos_empresa)) next
+
+  variables <- list()
+
+  for (variable in names(etiquetas)) {
+
+    hechos <- extraer_hechos(
+      datos_empresa,
+      etiquetas[[variable]]
+    )
+
+    tabla <- construir_trimestres(
+      hechos,
+      variable
+    )
+
+    if (nrow(tabla) == 0) next
+
+    variables[[variable]] <- tabla %>%
+      rename(!!variable := Valor)
+  }
+
+  if (!length(variables)) next
+
+  empresa_panel <- Reduce(
+    function(a, b) full_join(a, b, by = "Trimestre"),
+    variables
+  ) %>%
+    mutate(Ticker = ticker, .before = 1)
+
+  resultados_panel[[ticker]] <- empresa_panel
+
+  Sys.sleep(0.3)
+}
+
+# 9. Consolidar el panel
+if (!length(resultados_panel)) {
+  stop("No se descargaron datos financieros.")
+}
+
+panel_trimestral <- bind_rows(
+  resultados_panel
+)
+
+# Garantizar columnas requeridas
+for (v in c("Ingresos", "Utilidad_Neta", "Activos")) {
+  if (!v %in% names(panel_trimestral)) {
+    panel_trimestral[[v]] <- NA_real_
+  }
+}
+
+panel_trimestral <- panel_trimestral %>%
+  select(
+    Ticker,
+    Trimestre,
+    Ingresos,
+    Utilidad_Neta,
+    Activos
+  ) %>%
+  arrange(Ticker, Trimestre)
+
+# 10. Guardar CSV
+ruta_panel <- file.path(
+  ruta_datos,
+  "Panel_trimestral.csv"
+)
+
+readr::write_csv(
+  panel_trimestral,
+  ruta_panel
+)
+
+cat("\nArchivo generado en:\n")
+print(ruta_panel)
+
+# 11. Validar resultados
+resumen_panel <- panel_trimestral %>%
+  group_by(Ticker) %>%
+  summarise(
+    Trimestres = n(),
+    Completos = sum(
+      complete.cases(
+        Ingresos,
+        Utilidad_Neta,
+        Activos
+      )
+    ),
+    .groups = "drop"
+  )
+
+print(resumen_panel, n = Inf)
+
+cat("\nTotal de registros:",
+    nrow(panel_trimestral), "\n")
+
+cat("Registros completos:",
+    sum(complete.cases(
+      panel_trimestral[
+        c("Ingresos", "Utilidad_Neta", "Activos")
+      ]
+    )), "\n")
+
+# 12. Verificar duplicados
+stopifnot(
+  !anyDuplicated(
+    panel_trimestral[
+      c("Ticker", "Trimestre")
+    ]
+  )
+)
+
+panel_disponible <- TRUE
+
+# Mostrar primeras observaciones
+print(
+  head(panel_trimestral, 20),
+  width = Inf
+)
+
+obtener_cierres <- function(ingresos) {
+
+  q123 <- ingresos %>%
+    filter(
+      form == "10-Q",
+      fp %in% c("Q1", "Q2", "Q3"),
+      between(duracion, 65, 110)
+    ) %>%
+    group_by(fy, fp) %>%
+    arrange(desc(end), prioridad, filed, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(
+      Trimestre = paste0(fy, "-", fp),
+      Fecha_Cierre = end
+    )
+
+  q4 <- ingresos %>%
+    filter(
+      form == "10-K",
+      fp == "FY",
+      between(duracion, 330, 380)
+    ) %>%
+    group_by(fy) %>%
+    arrange(desc(end), prioridad, filed, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(
+      Trimestre = paste0(fy, "-Q4"),
+      Fecha_Cierre = end
+    )
+
+  bind_rows(q123, q4) %>%
+    distinct(Trimestre, .keep_all = TRUE)
+}
+
+activos_corregidos <- list()
+
+for (ticker in empresas_panel) {
+
+  cat("Corrigiendo activos:", ticker, "\n")
+
+  cik <- tabla_cik$CIK[tabla_cik$Ticker == ticker]
+
+  url <- paste0(
+    "https://data.sec.gov/api/xbrl/companyfacts/CIK",
+    cik, ".json"
+  )
+
+  hechos <- consultar_sec(url)
+
+  ingresos <- extraer_hechos(
+    hechos, etiquetas$Ingresos
+  )
+
+  activos <- extraer_hechos(
+    hechos, etiquetas$Activos
+  )
+
+  fechas <- obtener_cierres(ingresos)
+
+  seleccion <- activos %>%
+    inner_join(
+      fechas,
+      by = c("end" = "Fecha_Cierre")
+    ) %>%
+    group_by(Trimestre) %>%
+    arrange(prioridad, filed, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(
+      Ticker = ticker,
+      Trimestre,
+      Fecha_Cierre = end,
+      Activos = valor
+    )
+
+  activos_corregidos[[ticker]] <- seleccion
+
+  Sys.sleep(0.3)
+}
+
+activos_corregidos <- bind_rows(activos_corregidos)
+
+# Comprobar cobertura antes de modificar el archivo
+stopifnot(
+  nrow(activos_corregidos) == 160,
+  !anyDuplicated(
+    activos_corregidos[c("Ticker", "Trimestre")]
+  ),
+  all(is.finite(activos_corregidos$Activos))
+)
+
+# Mostrar los valores que cambiaron
+comparacion_activos <- panel_trimestral %>%
+  select(
+    Ticker,
+    Trimestre,
+    Activos_Anterior = Activos
+  ) %>%
+  inner_join(
+    activos_corregidos,
+    by = c("Ticker", "Trimestre")
+  ) %>%
+  filter(Activos_Anterior != Activos)
+
+print(comparacion_activos, n = Inf)
+
+# Actualizar panel
+panel_trimestral <- panel_trimestral %>%
+  select(-Activos) %>%
+  inner_join(
+    activos_corregidos,
+    by = c("Ticker", "Trimestre")
+  ) %>%
+  select(
+    Ticker, Trimestre, Fecha_Cierre,
+    Ingresos, Utilidad_Neta, Activos
+  ) %>%
+  arrange(Ticker, Trimestre)
+
+# Comprobación contra el informe oficial de Apple
+apple_q1 <- panel_trimestral %>%
+  filter(
+    Ticker == "AAPL",
+    Trimestre == "2022-Q1"
+  )
+
+stopifnot(
+  nrow(apple_q1) == 1,
+  apple_q1$Fecha_Cierre == as.Date("2021-12-25"),
+  apple_q1$Activos == 381191000000
+)
+
+# Crear respaldo de la versión anterior
+ruta_respaldo <- file.path(
+  ruta_datos,
+  "Panel_trimestral_respaldo.csv"
+)
+
+if (!file.exists(ruta_respaldo)) {
+  file.copy(ruta_panel, ruta_respaldo)
+}
+
+# Guardar datos corregidos
+readr::write_csv(panel_trimestral, ruta_panel)
+
+cat("\nPanel corregido guardado.\n")
+cat("Observaciones:", nrow(panel_trimestral), "\n")
+
+#La construcción del panel incorpora información fundamental distinta de los precios bursátiles y permite estudiar rentabilidad empresarial con una dimensión temporal y otra transversal. La corrección demuestra la importancia de respetar las fechas contables y los calendarios fiscales, ya que un dato financiero verdadero puede quedar incorrectamente vinculado a otro trimestre.
+
+```
+
+## Bloque 24. Modelo de panel trimestral (si existen datos)
+
+```{r}
+#Se estima una regresión lineal con el margen neto (utilidad neta dividida entre ingresos) como variable dependiente y los logaritmos de ingresos y activos como variables explicativas. Se incluyen variables indicadoras por empresa y trimestre calendario para controlar diferencias persistentes entre compañías y efectos comunes de cada periodo.
+
+panel_modelable <- panel_trimestral %>%
+  filter(
+    is.finite(Ingresos), Ingresos > 0,
+    is.finite(Activos), Activos > 0,
+    is.finite(Utilidad_Neta),
+    !is.na(Fecha_Cierre)
+  ) %>%
+  mutate(
+    Margen_Neto = Utilidad_Neta / Ingresos,
+    Log_Ingresos = log(Ingresos),
+    Log_Activos = log(Activos),
+    Periodo_Calendario = paste0(
+      lubridate::year(Fecha_Cierre),
+      "-Q",
+      lubridate::quarter(Fecha_Cierre)
+    )
+  )
+
+modelo_panel <- lm(
+  Margen_Neto ~
+    Log_Ingresos +
+    Log_Activos +
+    factor(Ticker) +
+    factor(Periodo_Calendario),
+  data = panel_modelable
+)
+
+summary(modelo_panel)
+
+cat("\nNúmero de observaciones:",
+    nobs(modelo_panel), "\n")
+
+cat("R2 ajustado:",
+    summary(modelo_panel)$adj.r.squared, "\n")
+#Con 160 observaciones, el modelo obtuvo R² de 0.4686 y R² ajustado de 0.3500; la prueba F global resultó significativa (valor p = 3.49 × 10⁻⁸). El coeficiente de logaritmo de ingresos fue 0.37321 (valor p = 3.65 × 10⁻⁸), mientras que el de activos fue −0.28147 (valor p = 0.02098).
+
+#El modelo identifica asociaciones estadísticamente significativas entre el margen neto y las dos variables financieras, una vez incorporadas las indicadoras por empresa y periodo. Como el margen se expresa en proporción y las variables explicativas en logaritmos, una variación aproximada del 1% en ingresos se asocia con 0.37 puntos porcentuales adicionales del margen, manteniendo lo demás constante; el mismo aumento en activos se asocia con cerca de 0.28 puntos porcentuales menos. Estas relaciones son descriptivas, no causales, y la significancia se basa en errores estándar convencionales; sería recomendable contrastarla con errores robustos agrupados por empresa.
+
+
+```
+
+## Bloque 25. Resumen, exportación y entregables
+
+
+```{r}
+# Recomendación final de inversión
+###Considerando un capital hipotético de 100,000 dólares estadounidenses y los precios de cierre del 9 de noviembre de 2026, se propone distribuir la inversión principalmente entre AbbVie, Johnson & Johnson y Merck, asignando aproximadamente el 20% del capital a cada una. El capital restante se distribuiría entre Apple, Adobe, Eli Lilly, Microsoft, Oracle y Pfizer, conforme a los pesos determinados por la optimización.
+
+library(dplyr)
+library(ggplot2)
+
+fecha_precios <- as.Date("2026-11-09")
+capital_usd <- 100000
+
+# Precios de cierre del 9 de noviembre de 2026
+precios_cierre <- c(
+  AAPL = 350.60,
+  ABBV = 293.31,
+  ADBE = 237.27,
+  JNJ  = 282.13,
+  LLY  = 1412.05,
+  MRK  = 148.72,
+  MSFT = 545.24,
+  NVDA = 178.59,
+  ORCL = 119.77,
+  PFE  = 29.24
+)
+
+# Verificar correspondencia de empresas
+stopifnot(
+  all(empresas %in% names(precios_cierre)),
+  all(empresas %in% names(pesos_minvar))
+)
+
+# Pesos optimizados originalmente
+pesos_finales <- pmax(
+  0,
+  as.numeric(pesos_minvar[empresas])
+)
+
+pesos_finales <- pesos_finales / sum(pesos_finales)
+
+# Precios en el mismo orden
+precios <- as.numeric(precios_cierre[empresas])
+
+# Capital objetivo por empresa
+capital_objetivo <- capital_usd * pesos_finales
+
+# Numero de acciones completas
+acciones <- floor(capital_objetivo / precios)
+
+# Construir tabla de inversion
+propuesta_inversion <- tibble(
+  Ticker = empresas,
+  Sector = sectores$Sector,
+  Precio_USD = precios,
+  Peso_Objetivo_Pct = 100 * pesos_finales,
+  Capital_Objetivo_USD = capital_objetivo,
+  Acciones = as.integer(acciones),
+  Inversion_USD = round(acciones * precios, 2)
+) %>%
+  mutate(
+    Peso_Real_Pct = 100 * Inversion_USD / capital_usd
+  )
+
+# Resumen financiero
+total_invertido <- sum(propuesta_inversion$Inversion_USD)
+efectivo_restante <- capital_usd - total_invertido
+
+print(propuesta_inversion, n = Inf, width = Inf)
+
+cat("\nFecha:", as.character(fecha_precios))
+cat("\nCapital inicial USD:", capital_usd)
+cat("\nTotal invertido USD:", round(total_invertido, 2))
+cat("\nEfectivo restante USD:", round(efectivo_restante, 2))
+cat("\nAcciones adquiridas:", sum(acciones))
+cat("\nEmpresas con posicion:",
+    sum(acciones > 0), "\n")
+
+# Grafica de distribucion del capital
+ggplot(
+  propuesta_inversion,
+  aes(
+    x = reorder(Ticker, Inversion_USD),
+    y = Inversion_USD,
+    fill = Sector
+  )
+) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::label_dollar()
+  ) +
+  labs(
+    title = "Propuesta de inversion - 9 noviembre 2026",
+    subtitle = "Portafolio de minima varianza",
+    x = "Empresa",
+    y = "Capital invertido (USD)",
+    fill = "Sector"
+  ) +
+  theme_minimal()
+
+# Exportar resultados
+readr::write_csv(
+  propuesta_inversion,
+  file.path(ruta_datos, "Propuesta_Inversion_2026.csv")
+)
+
+##Bajo esta propuesta se adquirirían 704 acciones completas, con una inversión estimada de 98,576.61 dólares y un saldo disponible de 1,423.39 dólares, sin considerar comisiones ni otros costos de operación. NVIDIA no recibiría asignación debido a que el modelo de mínima varianza determinó una participación prácticamente nula bajo las restricciones establecidas.
+
+##Es importante señalar que, aunque el portafolio optimizado mostró resultados favorables durante el periodo analizado, estos corresponden a un ejercicio histórico y no constituyen una estimación garantizada de rendimientos futuros. Asimismo, los modelos predictivos evaluados mediante regresiones y ARIMA no demostraron ventajas consistentes frente a referencias sencillas, por lo que no existe evidencia suficiente para establecer objetivos confiables de precios futuros.
+
+##En conclusión, la estrategia de mínima varianza constituye la alternativa más favorable dentro de las dos estrategias de portafolio evaluadas durante el periodo de prueba, especialmente para un enfoque orientado a controlar la volatilidad. Sin embargo, la concentración del capital en el sector salud, los cambios en las condiciones del mercado y la incertidumbre asociada a los rendimientos futuros hacen necesario un seguimiento periódico y una revisión de los pesos antes de realizar operaciones reales.
+
+```
